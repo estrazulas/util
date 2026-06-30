@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# =============================================================================
+# vbox-fix-network — Restaura rede após save/restore de estado no VirtualBox
+# =============================================================================
+# Problema: Ao salvar/restaurar estado da VM no VirtualBox, o driver e1000
+# perde o link brevemente e o NetworkManager falha em renovar o DHCP.
+# Resultado: interfaces enp0s3 e/ou enp0s8 ficam sem conectividade.
+#
+# Uso: fix-network [--check] [--interface iface]
+#   --check       Apenas verifica sem resetar (padrão: sempre corrige)
+#   --interface   Interface específica (default: enp0s3)
+#   --help        Mostra esta ajuda
+# =============================================================================
+
+set -euo pipefail
+
+# ── Configuração ────────────────────────────────────────────────────────────
+INTERFACE="enp0s3"
+GATEWAY="10.0.2.2"
+FORCE=true
+WAIT_LINK=6        # segundos para esperar link subir após reset
+PING_COUNT=2
+PING_TIMEOUT=3
+
+# ── Cores ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# ── Funções ─────────────────────────────────────────────────────────────────
+log()  { echo -e "${CYAN}[vbox-fix]${NC} $*"; }
+ok()   { echo -e "${GREEN}[vbox-fix] ✓${NC} $*"; }
+warn() { echo -e "${YELLOW}[vbox-fix] ⚠${NC} $*"; }
+err()  { echo -e "${RED}[vbox-fix] ✗${NC} $*"; }
+
+usage() {
+    sed -n '2,13p' "$0"
+    exit 0
+}
+
+# ── Argumentos ──────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)    FORCE=false; shift ;;
+        --force)    FORCE=true; shift ;;   # legacy, agora é o padrão
+        --interface) INTERFACE="$2"; shift 2 ;;
+        --help)     usage ;;
+        *) echo "Opção inválida: $1"; usage ;;
+    esac
+done
+
+# ── Verificar se é root ─────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    warn "Este script precisa de privilégios root para manipular interfaces."
+    warn "Re-executando com sudo..."
+    exec sudo "$0" "$@"
+fi
+
+# ── Descobrir gateway ───────────────────────────────────────────────────────
+CONN_NAME=""
+if command -v nmcli &>/dev/null; then
+    CONN_NAME=$(nmcli -t -f DEVICE,NAME connection show --active 2>/dev/null \
+        | grep "^${INTERFACE}:" | cut -d: -f2 || true)
+    if [[ -z "$CONN_NAME" ]]; then
+        # Tenta pegar qualquer conexão associada à interface
+        CONN_NAME=$(nmcli -t -f DEVICE,NAME connection show 2>/dev/null \
+            | grep "^${INTERFACE}:" | head -1 | cut -d: -f2 || true)
+    fi
+fi
+
+# Se o gateway não foi detectado, tenta pegar da rota atual
+if ip route show dev "$INTERFACE" default 2>/dev/null | grep -q .; then
+    GATEWAY=$(ip route show dev "$INTERFACE" default 2>/dev/null | awk '{print $3}' | head -1)
+fi
+
+log "Interface alvo: ${YELLOW}${INTERFACE}${NC}"
+log "Gateway:        ${YELLOW}${GATEWAY}${NC}"
+[[ -n "$CONN_NAME" ]] && log "Conexão NM:     ${YELLOW}${CONN_NAME}${NC}"
+
+# ── 1. Testar conectividade ────────────────────────────────────────────────
+echo ""
+log "Testando conectividade (ping ${GATEWAY})..."
+if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$GATEWAY" &>/dev/null; then
+    ok "Conectividade OK — gateway ${GATEWAY} respondeu ao ping"
+    if [[ "$FORCE" == false ]]; then
+        log "Rede está funcionando. Nada a fazer (modo --check)."
+        exit 0
+    fi
+    warn "Rede OK, mas resetando mesmo assim (comportamento padrão)"
+else
+    err "Sem conectividade — gateway ${GATEWAY} NÃO respondeu"
+fi
+
+# ── 2. Nível 1: Reset via NetworkManager ───────────────────────────────────
+echo ""
+log "── Nível 1: Reset via NetworkManager ──"
+
+if [[ -n "$CONN_NAME" ]] && command -v nmcli &>/dev/null; then
+    warn "Desconectando '${CONN_NAME}'..."
+    nmcli connection down "$CONN_NAME" 2>/dev/null || true
+    sleep 2
+
+    warn "Reconectando '${CONN_NAME}'..."
+    nmcli connection up "$CONN_NAME" 2>/dev/null || true
+    sleep "$WAIT_LINK"
+
+    if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$GATEWAY" &>/dev/null; then
+        ok "Nível 1 funcionou — rede restaurada!"
+        exit 0
+    fi
+    err "Nível 1 falhou — tentando próximo nível..."
+else
+    warn "NetworkManager não disponível ou conexão não encontrada, pulando nível 1"
+fi
+
+# ── 3. Nível 2: Reset físico da interface + renew DHCP ─────────────────────
+echo ""
+log "── Nível 2: Reset físico da interface ──"
+
+# Derruba a interface
+warn "Derubando interface ${INTERFACE}..."
+ip link set "$INTERFACE" down
+sleep 2
+
+# Sobe de novo
+warn "Subindo interface ${INTERFACE}..."
+ip link set "$INTERFACE" up
+sleep 3
+
+# Aguarda o link estabilizar
+for i in $(seq 1 "$WAIT_LINK"); do
+    if ip link show "$INTERFACE" | grep -q "LOWER_UP"; then
+        ok "Link físico detectado (LOWER_UP)"
+        break
+    fi
+    warn "Aguardando link subir... (${i}/${WAIT_LINK})"
+    sleep 1
+done
+
+# Tenta renovar DHCP
+if command -v dhcpcd &>/dev/null; then
+    warn "Renovando DHCP via dhcpcd..."
+    dhcpcd -n "$INTERFACE" 2>/dev/null || dhcpcd -N "$INTERFACE" 2>/dev/null || true
+elif command -v dhclient &>/dev/null; then
+    warn "Renovando DHCP via dhclient..."
+    dhclient -r "$INTERFACE" 2>/dev/null || true
+    sleep 1
+    dhclient "$INTERFACE" 2>/dev/null || true
+elif command -v nmcli &>/dev/null; then
+    warn "Reaplicando DHCP via nmcli..."
+    nmcli device reapply "$INTERFACE" 2>/dev/null || true
+fi
+
+sleep 3
+
+if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$GATEWAY" &>/dev/null; then
+    ok "Nível 2 funcionou — rede restaurada!"
+    # Se temos NetworkManager, garantir que ele reconhece o novo estado
+    if command -v nmcli &>/dev/null && [[ -n "$CONN_NAME" ]]; then
+        nmcli connection up "$CONN_NAME" 2>/dev/null || true
+    fi
+    exit 0
+fi
+err "Nível 2 falhou — tentando último recurso..."
+
+# ── 4. Nível 3: Recarregar módulo e1000 (último recurso) ───────────────────
+echo ""
+log "── Nível 3: Recarregar módulo e1000 ──"
+
+# Verifica se a interface usa e1000
+DRIVER=$(ethtool -i "$INTERFACE" 2>/dev/null | grep "^driver:" | awk '{print $2}' || true)
+if [[ -z "$DRIVER" ]]; then
+    DRIVER="e1000"  # assume e1000 como padrão no VirtualBox
+fi
+
+warn "Recarregando módulo '${DRIVER}'..."
+modprobe -r "$DRIVER" 2>/dev/null && sleep 1 && modprobe "$DRIVER" 2>/dev/null || {
+    err "Falha ao recarregar módulo ${DRIVER}"
+    err "Talvez seja necessário reiniciar a VM desta vez."
+    exit 1
+}
+
+sleep 3
+
+# Sobe a interface de novo
+ip link set "$INTERFACE" up 2>/dev/null || true
+sleep "$WAIT_LINK"
+
+# Reaplica a conexão no NetworkManager
+if [[ -n "$CONN_NAME" ]] && command -v nmcli &>/dev/null; then
+    nmcli connection up "$CONN_NAME" 2>/dev/null || true
+fi
+
+sleep 4
+
+if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$GATEWAY" &>/dev/null; then
+    ok "Nível 3 funcionou — rede restaurada após recarregar módulo!"
+    exit 0
+fi
+
+err "Todos os níveis falharam. Infelizmente será necessário reiniciar a VM."
+err "Debug: verifique 'ip link show ${INTERFACE}' e 'dmesg | tail -30'"
+exit 1
