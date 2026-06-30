@@ -1,0 +1,148 @@
+#!/bin/bash
+# ============================================================
+# clipsync - Compartilha clipboard entre duas maquinas
+# ============================================================
+# Rode este script em AMBAS as maquinas Linux.
+#
+# Uso: clipsync <ip-da-outra-maquina> [porta]
+# Ex:  clipsync 192.168.56.101
+#      clipsync 192.168.56.101 5555
+#
+# Como funciona:
+#   1. Fica ouvindo na porta 9999 por dados do clipboard remoto
+#   2. Vigia o clipboard local (polling 500ms)
+#   3. Quando vc copia algo (Ctrl+C), envia automaticamente
+#   4. Quando recebe algo, joga no clipboard local
+#   5. Usa hash pra evitar loop infinito (nao reenvia o que recebeu)
+#
+# Suporta Wayland (wl-clipboard) e X11 (xclip).
+# ============================================================
+
+set -e
+
+REMOTE="${1:?Erro: informe o IP da outra maquina. Uso: clipsync <ip-remoto> [porta]}"
+PORT="${2:-9999}"
+STATE_DIR="/tmp/clipsync"
+mkdir -p "$STATE_DIR"
+
+# Arquivos de estado (um por maquina remota)
+RECV_FILE="$STATE_DIR/last-recv-${REMOTE//[.\/]/_}"
+SENT_FILE="$STATE_DIR/last-sent-${REMOTE//[.\/]/_}"
+
+# ── Detecta clipboard tool disponivel ──
+if command -v wl-copy &>/dev/null && command -v wl-paste &>/dev/null; then
+    # Wayland
+    CLIP_READ="wl-paste"
+    CLIP_WRITE="wl-copy"
+    CLIP_MODE="wayland"
+elif command -v xclip &>/dev/null; then
+    # X11 (no --watch, usaremos polling)
+    CLIP_READ="xclip -selection clipboard -o"
+    CLIP_WRITE="xclip -selection clipboard"
+    CLIP_MODE="x11"
+elif command -v xsel &>/dev/null; then
+    CLIP_READ="xsel --clipboard --output"
+    CLIP_WRITE="xsel --clipboard --input"
+    CLIP_MODE="x11"
+else
+    echo "[clipsync] ERRO: instale wl-clipboard (Wayland) ou xclip (X11)"
+    echo "  sudo apt install xclip"
+    exit 1
+fi
+
+echo "[clipsync] Usando $CLIP_MODE ($CLIP_WRITE)"
+
+# ── Funcao: calcula hash MD5 ──
+get_hash() {
+    echo "$1" | md5sum | cut -d' ' -f1
+}
+
+# ── Funcao: recebe da rede -> cola no clipboard local ──
+run_listener() {
+    echo "[clipsync] Ouvindo em :$PORT por dados de $REMOTE..."
+
+    while true; do
+        # nc -l -p PORT: OpenBSD netcat syntax (padrao Ubuntu/Debian)
+        DATA=$(nc -l -p "$PORT" 2>/dev/null) || continue
+        [ -z "$DATA" ] && continue
+
+        HASH=$(get_hash "$DATA")
+        LAST_RECV=$(cat "$RECV_FILE" 2>/dev/null || true)
+
+        if [ "$HASH" != "$LAST_RECV" ]; then
+            echo "$HASH" > "$RECV_FILE"
+            echo "$HASH" > "$SENT_FILE"  # tambem evita reenvio local
+            printf '%s' "$DATA" | $CLIP_WRITE
+            echo "[clipsync] Recebido -> clipboard ($(echo "$DATA" | wc -c) bytes)"
+        fi
+    done
+}
+
+# ── Inicia listener em background ──
+run_listener &
+LISTENER_PID=$!
+
+echo "[clipsync] Conectado a $REMOTE:$PORT"
+echo "[clipsync] Vigilando clipboard local..."
+echo "[clipsync]    Ctrl+C para parar"
+
+# ── Limpeza ao sair ──
+cleanup() {
+    echo ""
+    echo "[clipsync] Parando..."
+    kill $LISTENER_PID 2>/dev/null || true
+    # Mata wl-paste --watch se foi usado
+    [ -n "$WL_WATCH_PID" ] && kill "$WL_WATCH_PID" 2>/dev/null || true
+    exit 0
+}
+trap cleanup INT TERM
+
+# ── Vigia clipboard local -> envia pra rede ──
+
+if [ "$CLIP_MODE" = "wayland" ]; then
+    # Wayland: wl-paste --watch notifica cada mudanca (sem polling)
+    wl-paste --watch sh -c '
+        DATA=$(cat)
+        [ -z "$DATA" ] && exit 0
+        HASH=$(echo "$DATA" | md5sum | cut -d" " -f1)
+        LAST_RECV=$(cat '"$RECV_FILE"' 2>/dev/null || true)
+        [ "$HASH" = "$LAST_RECV" ] && exit 0
+        echo "$HASH" > '"$SENT_FILE"'
+        printf "%s" "$DATA" | nc -N '"$REMOTE"' '"$PORT"' 2>/dev/null
+        echo "[clipsync] Enviado -> '"$REMOTE"' ($(echo "$DATA" | wc -c) bytes)"
+    ' 2>/dev/null &
+    WL_WATCH_PID=$!
+    wait $LISTENER_PID
+
+else
+    # X11: polling a cada 500ms
+    LAST_TEXT=""
+
+    while true; do
+        sleep 0.5
+
+        CURRENT=$($CLIP_READ 2>/dev/null) || continue
+        [ -z "$CURRENT" ] && continue
+        [ "$CURRENT" = "$LAST_TEXT" ] && continue
+
+        LAST_TEXT="$CURRENT"
+        HASH=$(get_hash "$CURRENT")
+
+        # Nao reenvia o que acabou de chegar da rede
+        LAST_RECV=$(cat "$RECV_FILE" 2>/dev/null || true)
+        [ "$HASH" = "$LAST_RECV" ] && continue
+
+        # Nao reenvia o que ja enviamos
+        LAST_SENT=$(cat "$SENT_FILE" 2>/dev/null || true)
+        [ "$HASH" = "$LAST_SENT" ] && continue
+
+        echo "$HASH" > "$SENT_FILE"
+
+        # Envia pra rede (nc -N: fecha conexao apos EOF)
+        if printf '%s' "$CURRENT" | nc -N "$REMOTE" "$PORT" 2>/dev/null; then
+            echo "[clipsync] Enviado -> $REMOTE ($(echo "$CURRENT" | wc -c) bytes)"
+        else
+            echo "[clipsync] Falha ao enviar para $REMOTE:$PORT - Linux remoto rodando?"
+        fi
+    done
+fi
