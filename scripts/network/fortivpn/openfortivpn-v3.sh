@@ -180,11 +180,13 @@ function watch(){
         local WAS_CONNECTED=false
         local LAST_NETWORK_FIX=0
         local FIX_COOLDOWN=180   # segundos entre chamadas ao fix-network
+        local LAST_TS=$(date +%s)  # v4: detecta resume de suspend/restore
 
         echo "====================================="
-        echo "  Watchdog VPN v3 — $(date '+%d/%m/%Y %H:%M')"
+        echo "  Watchdog VPN v4 — $(date '+%d/%m/%Y %H:%M')"
         echo "  Verificando conexão continuamente"
         echo "  fix-network: ${FIX_NETWORK_SCRIPT}"
+        echo "  Detecta resume de suspend/restore VM"
         echo "====================================="
 
         # Garante que está rodando ao iniciar
@@ -194,6 +196,52 @@ function watch(){
         fi
 
         while true; do
+                # ── v4: detecta resume de suspend/restore via salto temporal ──
+                local NOW
+                NOW=$(date +%s)
+                local GAP=$((NOW - LAST_TS))
+                # Se o gap for > 2x o delay máximo (300) + margem, houve suspend/restore
+                if [ "$GAP" -gt 660 ]; then
+                        echo "[$(date '+%H:%M:%S')] ⚡ Detectado resume de suspend/restore (gap: ${GAP}s)"
+                        echo "[$(date '+%H:%M:%S')]    Matando conexões VPN stale..."
+
+                        # Mata processo openfortivpn stale
+                        local STALE_PID
+                        STALE_PID=$(get_pid)
+                        if [ -n "$STALE_PID" ]; then
+                                echo "[$(date '+%H:%M:%S')]    Matando openfortivpn (PID ${STALE_PID})..."
+                                kill "$STALE_PID" 2>/dev/null || true
+                                sleep 1
+                                kill -9 "$STALE_PID" 2>/dev/null || true
+                        fi
+                        # Limpa pppd residuals
+                        pkill -f "pppd.*ppp0" 2>/dev/null || true
+                        sleep 1
+
+                        # Aguarda rede base estabilizar após resume
+                        echo "[$(date '+%H:%M:%S')]    Aguardando rede base estabilizar..."
+                        sleep 5
+
+                        if check_base_network; then
+                                echo "[$(date '+%H:%M:%S')]    Rede base OK. Reconectando VPN..."
+                        else
+                                echo "[$(date '+%H:%M:%S')]    Rede base caída. Acionando fix-network..."
+                                fix_base_network
+                        fi
+
+                        # Força reconexão limpa
+                        stop
+                        sleep 2
+                        start
+                        WAS_CONNECTED=false
+                        FAILS=0
+                        DELAY=10
+                        LAST_TS=$NOW
+                        sleep "$DELAY"
+                        continue
+                fi
+                LAST_TS=$NOW
+
                 # Verifica pause manual
                 if [ -f "$PAUSE_FILE" ]; then
                         if [ "$WAS_CONNECTED" == true ]; then
@@ -252,12 +300,12 @@ function watch(){
                                 start
                         else
                                 # Rede caída → tenta fix-network (com cooldown)
-                                local NOW
-                                NOW=$(date +%s)
-                                local ELAPSED=$((NOW - LAST_NETWORK_FIX))
+                                local NOW_FIX
+                                NOW_FIX=$(date +%s)
+                                local ELAPSED=$((NOW_FIX - LAST_NETWORK_FIX))
 
                                 if [ "$ELAPSED" -ge "$FIX_COOLDOWN" ]; then
-                                        LAST_NETWORK_FIX="$NOW"
+                                        LAST_NETWORK_FIX="$NOW_FIX"
                                         fix_base_network
                                         if [ $? -eq 0 ]; then
                                                 # Rede voltou → reconecta VPN
