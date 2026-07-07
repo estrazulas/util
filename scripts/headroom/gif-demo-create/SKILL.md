@@ -21,10 +21,10 @@ Generate an animated GIF tour of the Headroom admin interface (dashboard, users,
 
 ```bash
 # Default (localhost:8787, reads HEADROOM_API_KEY from env)
-uv run python ~/git/util/scripts/headroom/generate-admin-demo.py
+uv run python ~/git/util/scripts/headroom/gif-demo-create/generate-admin-demo.py
 
 # Custom URL + explicit key
-uv run python ~/git/util/scripts/headroom/generate-admin-demo.py \
+uv run python ~/git/util/scripts/headroom/gif-demo-create/generate-admin-demo.py \
   --url https://proxy.example.com \
   --api-key "hr_..." \
   --output /tmp/demo.gif
