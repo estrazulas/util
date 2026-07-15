@@ -1,0 +1,25 @@
+{
+  "name": "@estrazulas/yt-transcript-mcp",
+  "version": "0.0.1",
+  "description": "MCP server to extract YouTube video transcripts (TypeScript port of youtube_transcript_api)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "dev": "node --watch --inspect --experimental-strip-types src/index.ts",
+    "test": "node --test --experimental-strip-types tests/**/*.test.ts",
+    "mcp:inspect": "npx @modelcontextprotocol/inspector node --experimental-strip-types src/index.ts",
+    "test:dev": "node --inspect --test --watch --experimental-strip-types tests/**/*.test.ts"
+  },
+  "keywords": ["mcp", "youtube", "transcript", "captions"],
+  "author": "estrazulas",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": "v24.14.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@types/node": "^24.11.0",
+    "zod": "^3.25.76"
+  }
+}
